@@ -1,0 +1,184 @@
+name: Flutter APK Builder (Zip to APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_url:
+        description: "URL download ZIP project Flutter (release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag/identifier build ini"
+        required: true
+        type: string
+      build_type:
+        description: "Tipe build APK"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Download ZIP project
+        run: |
+          set -e
+          echo "Downloading: ${{ inputs.release_url }}"
+          curl -L --fail -o project.zip "${{ inputs.release_url }}"
+          test -s project.zip || { echo "::error::File project.zip kosong / gagal didownload"; exit 1; }
+
+      - name: Extract ZIP
+        run: |
+          set -e
+          mkdir -p project/extracted
+          unzip -q project.zip -d project/extracted
+          rm -f project.zip
+
+          # Handle kalau ZIP punya 1 folder pembungkus (root folder tunggal)
+          if [ ! -f "project/extracted/pubspec.yaml" ]; then
+            INNER_DIR=$(find project/extracted -maxdepth 1 -mindepth 1 -type d | head -n 1)
+            if [ -n "$INNER_DIR" ] && [ -f "$INNER_DIR/pubspec.yaml" ]; then
+              echo "Nested folder terdeteksi, memindahkan isi ke project/extracted..."
+              shopt -s dotglob
+              mv "$INNER_DIR"/* project/extracted/
+              rmdir "$INNER_DIR"
+            fi
+          fi
+
+          if [ ! -f "project/extracted/pubspec.yaml" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter yang valid."
+            exit 1
+          fi
+
+      - name: Deteksi versi Flutter yang cocok dengan Dart SDK project
+        id: detectver
+        run: |
+          cd project/extracted
+          VERSION=""
+
+          # 1. Prioritas: pin eksplisit dari .fvmrc (FVM)
+          if [ -f ".fvmrc" ]; then
+            VERSION=$(grep -oP '"flutter"\s*:\s*"\K[^"]+' .fvmrc 2>/dev/null || true)
+          fi
+
+          # 2. Prioritas: file .flutter-version (plain text)
+          if [ -z "$VERSION" ] && [ -f ".flutter-version" ]; then
+            VERSION=$(tr -d '[:space:]' < .flutter-version)
+          fi
+
+          # 3. Kalau tidak ada pin eksplisit, cari versi Flutter berdasarkan
+          #    constraint Dart SDK di pubspec.yaml (environment: sdk: '>=x.x.x <y.y.y')
+          if [ -z "$VERSION" ] && [ -f "pubspec.yaml" ]; then
+            SDK_CONSTRAINT=$(grep -A3 "^environment:" pubspec.yaml | grep -oP "sdk:\s*['\"]?\K[^'\"]+" | head -1)
+
+            if [ -n "$SDK_CONSTRAINT" ]; then
+              echo "Dart SDK constraint di pubspec.yaml: $SDK_CONSTRAINT"
+
+              MIN_DART=$(echo "$SDK_CONSTRAINT" | grep -oP '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)
+              if [ -n "$MIN_DART" ]; then
+                IFS='.' read -r MA MI PA <<< "$MIN_DART"
+                PA=${PA:-0}
+                MIN_DART="$MA.$MI.$PA"
+                echo "Minimum Dart SDK dibutuhkan: $MIN_DART"
+
+                curl -sL -o /tmp/flutter_releases.json \
+                  https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json
+
+                VERSION=$(jq -r --arg minver "$MIN_DART" '
+                  ($minver | split(".") | map(tonumber)) as $min
+                  | [.releases[]
+                      | select(.channel=="stable" and (.dart_sdk_version | type == "string"))
+                      | {flutter: .version, dart: (.dart_sdk_version | split(" ")[0])}
+                    ]
+                  | map(select(.dart | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")))
+                  | map(. + {dartver: (.dart | split(".") | map(tonumber))})
+                  | map(select(.dartver >= $min))
+                  | sort_by(.dartver)
+                  | (.[0].flutter // empty)
+                ' /tmp/flutter_releases.json)
+              fi
+            fi
+          fi
+
+          if [ -n "$VERSION" ]; then
+            echo "✅ Versi Flutter yang dipakai: $VERSION"
+            echo "flutter_version=$VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "ℹ️ Tidak ada versi cocok yang terdeteksi, pakai channel stable (terbaru)"
+            echo "flutter_version=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.detectver.outputs.flutter_version }}
+          channel: "stable"
+          cache: true
+
+      - name: Build APK
+        id: build
+        run: |
+          cd project/extracted
+
+          echo "📦 Running flutter clean..."
+          flutter clean
+
+          echo "📦 Running flutter pub get..."
+          flutter pub get
+
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            echo "🔨 Building debug APK..."
+            flutter build apk --debug
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            echo "🔨 Building release APK..."
+            flutter build apk --release
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+
+          if [ -f "$APK_PATH" ]; then
+            echo "✅ Build success!"
+            echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+            ls -la "$APK_PATH"
+          else
+            echo "❌ Build failed! Looking for APK..."
+            find . -name "*.apk" -type f || echo "No APK found"
+            exit 1
+          fi
+
+      - name: Rename APK sesuai tag
+        id: renameapk
+        run: |
+          set -e
+          SRC_PATH="project/extracted/${{ steps.build.outputs.apk_path }}"
+          NEW_NAME="app-${{ inputs.tag }}-${{ inputs.build_type }}.apk"
+          NEW_PATH="$(dirname "$SRC_PATH")/$NEW_NAME"
+          mv "$SRC_PATH" "$NEW_PATH"
+          echo "final_path=$NEW_PATH" >> "$GITHUB_OUTPUT"
+          echo "final_name=$NEW_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: ${{ steps.renameapk.outputs.final_path }}
+          retention-days: 2
+          if-no-files-found: error

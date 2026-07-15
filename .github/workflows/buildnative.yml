@@ -1,0 +1,166 @@
+name: Build Native APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'Nama Aplikasi'
+        required: true
+        default: 'My App'
+      package_name:
+        description: 'Package Name (com.xxx.xxx)'
+        required: true
+        default: 'com.example.app'
+      version_name:
+        description: 'Version Name'
+        required: true
+        default: '1.0.0'
+      version_code:
+        description: 'Version Code (angka)'
+        required: true
+        default: '1'
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      zip_url:
+        description: 'URL Download ZIP Project Flutter (GitHub Release asset)'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download & Extract Project ZIP
+        run: |
+          set -e
+          echo "Downloading project ZIP..."
+          curl -L --fail -o project.zip "${{ inputs.zip_url }}"
+
+          echo "Extracting..."
+          mkdir -p _project_extract
+          unzip -q -o project.zip -d _project_extract
+          rm -f project.zip
+
+          # Handle both cases: zip contains project files at root,
+          # or zip contains a single wrapper folder (e.g. myapp/android, myapp/lib...)
+          SRC_DIR="_project_extract"
+          if [ "$(find "$SRC_DIR" -maxdepth 1 -mindepth 1 | wc -l)" -eq 1 ] && \
+             [ -d "$(find "$SRC_DIR" -maxdepth 1 -mindepth 1)" ]; then
+            SRC_DIR="$(find "$SRC_DIR" -maxdepth 1 -mindepth 1)"
+          fi
+
+          if [ ! -f "$SRC_DIR/pubspec.yaml" ] && [ ! -d "$SRC_DIR/android" ]; then
+            echo "::error::ZIP tidak berisi project Flutter yang valid (pubspec.yaml / android/ tidak ditemukan)."
+            exit 1
+          fi
+
+          echo "Copying project files into workspace..."
+          cp -rf "$SRC_DIR"/. .
+          rm -rf _project_extract
+
+          echo "Project extracted:"
+          ls -la
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Pillow
+        run: pip install Pillow
+
+      - name: Generate App Icons
+        run: |
+          if [ -f "generate_icons.py" ]; then
+            python3 generate_icons.py
+          else
+            echo "generate_icons.py tidak ditemukan, melewati step ini (icon default project dipakai)."
+          fi
+
+      - name: Patch AndroidManifest.xml
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            OLD_PKG=$(grep -oP '(?<=package=")[^"]+' "$MANIFEST" | head -1)
+            if [ -n "$OLD_PKG" ]; then
+              echo "Old package found in manifest: $OLD_PKG (removing, namespace now set via build.gradle)"
+              # AGP 8+ no longer supports setting namespace via package attribute in the manifest.
+              sed -i "s|package=\"[^\"]*\"[[:space:]]*||g" "$MANIFEST"
+            fi
+            sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
+          fi
+
+      - name: Patch build.gradle
+        run: |
+          GRADLE="android/app/build.gradle"
+          if [ -f "$GRADLE" ]; then
+            sed -i "s|applicationId \"[^\"]*\"|applicationId \"${{ inputs.package_name }}\"|" "$GRADLE"
+            sed -i "s|versionCode [0-9]*|versionCode ${{ inputs.version_code }}|" "$GRADLE"
+            sed -i "s|versionName \"[^\"]*\"|versionName \"${{ inputs.version_name }}\"|" "$GRADLE"
+
+            if grep -q "namespace " "$GRADLE"; then
+              sed -i "s|namespace \"[^\"]*\"|namespace \"${{ inputs.package_name }}\"|" "$GRADLE"
+              echo "namespace updated to ${{ inputs.package_name }}"
+            else
+              # AGP 8+ requires namespace inside the android {} block instead of the manifest's package attribute.
+              sed -i "0,/android {/s//android {\n    namespace \"${{ inputs.package_name }}\"/" "$GRADLE"
+              echo "namespace inserted as ${{ inputs.package_name }}"
+            fi
+          fi
+
+      - name: Patch strings.xml
+        run: |
+          STRINGS="android/app/src/main/res/values/strings.xml"
+          if [ -f "$STRINGS" ]; then
+            sed -i "s|<string name=\"app_name\">[^<]*</string>|<string name=\"app_name\">${{ inputs.app_name }}</string>|g" "$STRINGS"
+          fi
+
+      - name: Setup Gradle Wrapper
+        run: |
+          curl -L -o android/gradle/wrapper/gradle-wrapper.jar \
+            "https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar"
+          chmod +x android/gradlew
+
+      - name: Build APK
+        run: |
+          cd android
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            ./gradlew assembleRelease --no-daemon
+          else
+            ./gradlew assembleDebug --no-daemon
+          fi
+
+      - name: Rename APK
+        run: |
+          mkdir -p output
+          if [ "${{ inputs.build_type }}" = "release" ]; then
+            APK_SRC="android/app/build/outputs/apk/release"
+          else
+            APK_SRC="android/app/build/outputs/apk/debug"
+          fi
+          find "$APK_SRC" -name "*.apk" | head -1 | xargs -I{} cp {} output/${{ inputs.app_name }}_v${{ inputs.version_name }}_${{ inputs.build_type }}.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-v${{ inputs.version_name }}-${{ inputs.build_type }}
+          path: output/*.apk
+          retention-days: 7
